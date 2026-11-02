@@ -1,0 +1,139 @@
+#!/bin/sh
+# Cambia IP pubblico facendo disconnetti/riconnetti sul FRITZ!Box via TR-064 (Mac/Linux: sh + curl).
+# Servono almeno 4 cicli perche' il provider assegni un IP nuovo.
+#
+#   fritz-reconnect -Setup        salva utente/password
+#   fritz-reconnect               almeno 4 cicli, poi continua finche' cambia la rete /16 (primi 2 numeri), max 30
+#   fritz-reconnect -Prefix 24    basta che cambino i primi 3 numeri
+#   fritz-reconnect -Status       mostra stato connessione e IP, non disconnette
+#   Altre opzioni: -Min N, -Max N, -Box HOST (o FRITZ_BOX, default 192.168.178.1, IP di fabbrica).
+#   Alternativa a -Setup: variabili d'ambiente FRITZ_USER e FRITZ_PASSWORD.
+
+# Git Bash / Cygwin: inoltra alla versione Windows
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) exec cmd //c "$(cygpath -w "$(dirname "$0")")\\fritz-reconnect.cmd" "$@" ;;
+esac
+
+die() { echo "fritz-reconnect: $*" >&2; exit 1; }
+need_num() { case "$2" in ''|*[!0-9]*) die "$1 vuole un numero" ;; esac; }
+
+min=4 max=30 prefix=16 box=${FRITZ_BOX:-192.168.178.1} setup=0 status=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -Setup) setup=1; shift; continue ;;
+    -Status) status=1; shift; continue ;;
+    -Min|-Max|-Prefix|-Box) [ $# -ge 2 ] || die "$1 vuole un valore" ;;
+    *) die "opzione sconosciuta: $1" ;;
+  esac
+  case "$1" in
+    -Min) need_num "$1" "$2"; min=$2 ;;
+    -Max) need_num "$1" "$2"; max=$2 ;;
+    -Prefix) case "$2" in 8|16|24) prefix=$2 ;; *) die "-Prefix vuole 8, 16 o 24" ;; esac ;;
+    -Box) box=$2 ;;
+  esac
+  shift 2
+done
+
+command -v curl >/dev/null 2>&1 || die "curl non trovato"
+# shortcut: password in chiaro con permessi 600 (niente DPAPI qui), per un portachiavi usare FRITZ_USER/FRITZ_PASSWORD
+cred_file=${XDG_CONFIG_HOME:-$HOME/.config}/fritz-reconnect/cred
+
+if [ "$setup" = 1 ]; then
+  printf 'Utente FRITZ!Box (%s): ' "$box"
+  IFS= read -r user || die "utente mancante"
+  trap 'stty echo 2>/dev/null' EXIT INT TERM
+  printf 'Password: '
+  stty -echo 2>/dev/null
+  IFS= read -r pass || die "password mancante"
+  stty echo 2>/dev/null
+  echo
+  umask 077
+  mkdir -p "$(dirname "$cred_file")" || exit 1
+  rm -f "$cred_file"
+  printf '%s\n%s\n' "$user" "$pass" > "$cred_file" || exit 1
+  echo "Credenziali salvate in $cred_file"
+  exit 0
+fi
+
+if [ -n "$FRITZ_USER" ] && [ -n "$FRITZ_PASSWORD" ]; then
+  user=$FRITZ_USER pass=$FRITZ_PASSWORD
+elif [ -f "$cred_file" ]; then
+  { IFS= read -r user; IFS= read -r pass; } < "$cred_file"
+else
+  die "Credenziali mancanti: esegui 'fritz-reconnect -Setup' oppure imposta FRITZ_USER/FRITZ_PASSWORD."
+fi
+
+base=${FRITZ_TR064_URL:-https://$box:49443}
+esc() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
+
+# Imposta resp e code. Credenziali via -K da stdin: mai sulla riga di comando (visibile in ps).
+# -k: certificato self-signed del box
+tr64() {
+  resp=$(printf 'user = "%s:%s"\n' "$(esc "$user")" "$(esc "$pass")" |
+    curl -sSk --digest -K - --max-time 15 \
+      -H 'Content-Type: text/xml; charset=utf-8' -H "SOAPAction: $1#$3" \
+      -d "<?xml version='1.0' encoding='utf-8'?><s:Envelope xmlns:s='http://schemas.xmlsoap.org/soap/envelope/' s:encodingStyle='http://schemas.xmlsoap.org/soap/encoding/'><s:Body><u:$3 xmlns:u='$1'/></s:Body></s:Envelope>" \
+      -w '\n%{http_code}' "$base$2" 2>/dev/null) || { code=000; return 1; }
+  code=$(printf '%s\n' "$resp" | tail -n 1)
+  [ "$code" = 200 ]
+}
+
+field() { printf '%s\n' "$resp" | sed -n "s:.*<$1>\([^<]*\)</$1>.*:\1:p" | head -n 1; }
+
+# DSL puo' essere PPPoE o IP: usa il servizio che risulta connesso
+svc_t= svc_p=
+for s in 'urn:dslforum-org:service:WANPPPConnection:1 /upnp/control/wanpppconn1' \
+         'urn:dslforum-org:service:WANIPConnection:1 /upnp/control/wanipconnection1'; do
+  t=${s% *} p=${s#* }
+  if tr64 "$t" "$p" GetStatusInfo; then
+    if [ "$(field NewConnectionStatus)" = Connected ]; then svc_t=$t svc_p=$p; break; fi
+  elif [ "$code" = 401 ]; then
+    die "Accesso negato dal FRITZ!Box (401): controlla utente/password e il permesso 'Impostazioni FRITZ!Box'."
+  fi
+done
+[ -n "$svc_t" ] || die "Nessuna connessione WAN attiva trovata via TR-064."
+
+get_status() { tr64 "$svc_t" "$svc_p" GetStatusInfo && field NewConnectionStatus; }
+get_ip() { tr64 "$svc_t" "$svc_p" GetExternalIPAddress && field NewExternalIPAddress; }
+get_net() { printf '%s' "$1" | cut -d. -f1-$((prefix / 8)); }
+
+# wait_status up|down timeout_s
+wait_status() {
+  deadline=$(($(date +%s) + $2))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if st=$(get_status) && [ -n "$st" ]; then
+      case "$1" in
+        up) [ "$st" = Connected ] && return 0 ;;
+        down) [ "$st" != Connected ] && return 0 ;;
+      esac
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+start_ip=$(get_ip) && [ -n "$start_ip" ] || die "IP pubblico non disponibile."
+if [ "$status" = 1 ]; then
+  echo "Stato: $(get_status)  IP: $start_ip  (${svc_t##*service:})"
+  exit 0
+fi
+
+echo "IP iniziale: $start_ip"
+ip=$start_ip
+i=1
+while [ "$i" -le "$max" ]; do
+  tr64 "$svc_t" "$svc_p" ForceTermination  # risponde spesso con errore anche quando disconnette
+  wait_status down 30
+  tr64 "$svc_t" "$svc_p" RequestConnection
+  wait_status up 120 || die "Ciclo $i: connessione non ripristinata entro 120 s."
+  ip=$(get_ip) && [ -n "$ip" ] || die "Ciclo $i: IP pubblico non disponibile."
+  echo "Ciclo $i/$min+: IP $ip"
+  if [ "$i" -ge "$min" ] && [ "$(get_net "$ip")" != "$(get_net "$start_ip")" ]; then break; fi
+  i=$((i + 1))
+done
+
+if [ "$(get_net "$ip")" != "$(get_net "$start_ip")" ]; then
+  echo "Rete /$prefix cambiata: $start_ip -> $ip"
+  exit 0
+fi
+die "Rete /$prefix invariata ($(get_net "$ip").*) dopo $max cicli."

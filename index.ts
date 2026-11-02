@@ -30,6 +30,7 @@ async function waitInternet(maxWaitMs: number): Promise<boolean> {
 export default Plugin.define({
   id: "fritz-newip",
   async setup(ctx) {
+    console.log("[fritz-newip] setup ok, registro hook retry")
     let lastRun = 0
     let running = false
 
@@ -58,7 +59,8 @@ export default Plugin.define({
       lastRun = Date.now()
       try {
         await new Promise<void>((resolve) => {
-          execFile("fritz-reconnect", [], { timeout: 240_000 }, (err) => {
+          // shell su Windows: execFile da solo non lancia i .cmd
+          execFile("fritz-reconnect", [], { timeout: 240_000, shell: process.platform === "win32" }, (err) => {
             if (err) console.error("[fritz-newip] fritz-reconnect error:", err)
             resolve()
           })
